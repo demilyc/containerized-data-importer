@@ -21,7 +21,7 @@ const (
 	CDIComponentLabel = "cdi.kubevirt.io"
 
 	// PrometheusLabel provides the label to indicate prometheus metrics are available in the pods.
-	PrometheusLabel = "prometheus.kubevirt.io"
+	PrometheusLabel = "prometheus.cdi.kubevirt.io"
 
 	// ImporterVolumePath provides a constant for the directory where the PV is mounted.
 	ImporterVolumePath = "/data"
@@ -29,7 +29,10 @@ const (
 	DiskImageName = "disk.img"
 	// ImporterWritePath provides a constant for the cmd/cdi-importer/importer.go executable
 	ImporterWritePath = ImporterVolumePath + "/" + DiskImageName
-
+	// ImporterWriteBlockPath provides a constant for the path where the PV is mounted.
+	ImporterWriteBlockPath = "/dev/blockDevice"
+	// PodTerminationMessageFile is the name of the file to write the termination message to.
+	PodTerminationMessageFile = "/dev/termination-log"
 	// ImporterPodName provides a constant to use as a prefix for Pods created by CDI (controller only)
 	ImporterPodName = "importer"
 	// ImporterDataDir provides a constant for the controller pkg to use as a hardcoded path to where content is transferred to/from (controller only)
@@ -38,7 +41,7 @@ const (
 	ScratchDataDir = "/scratch"
 	// ImporterS3Host provides an S3 string used by importer/dataStream.go only
 	ImporterS3Host = "s3.amazonaws.com"
-	// ImporterCertDir is where the configmap containg certs will be mounted
+	// ImporterCertDir is where the configmap containing certs will be mounted
 	ImporterCertDir = "/certs"
 	// DefaultPullPolicy imports k8s "IfNotPresent" string for the import_controller_gingko_test and the cdi-controller executable
 	DefaultPullPolicy = string(v1.PullIfNotPresent)
@@ -77,12 +80,13 @@ const (
 	// ClonerSocketPath (controller pkg only)
 	ClonerSocketPath = "/tmp/clone/socket"
 
+	// SmartClonerCDILabel is the label applied to resources created by the smart-clone controller
+	SmartClonerCDILabel = "cdi-smart-clone"
+
 	// UploadServerCDILabel is the label applied to upload server resources
 	UploadServerCDILabel = "cdi-upload-server"
-
 	// UploadServerPodname is name of the upload server pod container
 	UploadServerPodname = UploadServerCDILabel
-
 	// UploadServerDataDir is the destination directoryfor uploads
 	UploadServerDataDir = ImporterDataDir
 	// UploadServerServiceLabel is the label selector for upload server services
@@ -103,7 +107,6 @@ const (
 
 	// DefaultResyncPeriod sets a 10 minute resync period, used in the controller pkg and the controller cmd executable
 	DefaultResyncPeriod = 10 * time.Minute
-
 	// InsecureRegistryConfigMap is the name of the ConfigMap for insecure registries
 	InsecureRegistryConfigMap = "cdi-insecure-registries"
 

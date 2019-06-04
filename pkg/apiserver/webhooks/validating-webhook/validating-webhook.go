@@ -8,12 +8,14 @@ import (
 	"net/url"
 
 	"k8s.io/api/admission/v1beta1"
+	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/klog"
 	cdicorev1alpha1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
+	"kubevirt.io/containerized-data-importer/pkg/controller"
 )
 
 type admitFunc func(*v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
@@ -145,6 +147,16 @@ func validateDataVolumeSpec(field *k8sfield.Path, spec *cdicorev1alpha1.DataVolu
 		return causes
 	}
 
+	if spec.Source.Registry != nil && spec.ContentType != "" && string(spec.ContentType) != string(cdicorev1alpha1.DataVolumeKubeVirt) {
+		sourceType = field.Child("contentType").String()
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("ContentType must be" + string(cdicorev1alpha1.DataVolumeKubeVirt) + "when Source is Registry"),
+			Field:   sourceType,
+		})
+		return causes
+	}
+
 	if spec.Source.PVC != nil {
 		if spec.Source.PVC.Namespace == "" || spec.Source.PVC.Name == "" {
 			causes = append(causes, metav1.StatusCause{
@@ -156,7 +168,7 @@ func validateDataVolumeSpec(field *k8sfield.Path, spec *cdicorev1alpha1.DataVolu
 		}
 		client := GetClient()
 		if client != nil {
-			_, err := client.CoreV1().PersistentVolumeClaims(spec.Source.PVC.Namespace).Get(spec.Source.PVC.Name, metav1.GetOptions{})
+			sourcePVC, err := client.CoreV1().PersistentVolumeClaims(spec.Source.PVC.Namespace).Get(spec.Source.PVC.Name, metav1.GetOptions{})
 			if err != nil {
 				if k8serrors.IsNotFound(err) {
 					causes = append(causes, metav1.StatusCause{
@@ -166,6 +178,15 @@ func validateDataVolumeSpec(field *k8sfield.Path, spec *cdicorev1alpha1.DataVolu
 					})
 					return causes
 				}
+			}
+			err = controller.ValidateCanCloneSourceAndTargetSpec(&sourcePVC.Spec, spec.PVC)
+			if err != nil {
+				causes = append(causes, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueInvalid,
+					Message: err.Error(),
+					Field:   field.Child("PVC").String(),
+				})
+				return causes
 			}
 		}
 	}
@@ -178,16 +199,42 @@ func validateDataVolumeSpec(field *k8sfield.Path, spec *cdicorev1alpha1.DataVolu
 		})
 		return causes
 	}
-	pvcSize := spec.PVC.Resources.Requests["storage"]
-	if pvcSize.IsZero() || pvcSize.Value() < 0 {
+	if pvcSize, ok := spec.PVC.Resources.Requests["storage"]; ok {
+		if pvcSize.IsZero() || pvcSize.Value() < 0 {
+			causes = append(causes, metav1.StatusCause{
+				Type:    metav1.CauseTypeFieldValueInvalid,
+				Message: fmt.Sprintf("PVC size can't be equal or less than zero"),
+				Field:   field.Child("PVC", "resources", "requests", "size").String(),
+			})
+			return causes
+		}
+	} else {
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
-			Message: fmt.Sprintf("PVC size can't be equal or less than zero"),
+			Message: fmt.Sprintf("PVC size is missing"),
 			Field:   field.Child("PVC", "resources", "requests", "size").String(),
 		})
 		return causes
 	}
 
+	accessModes := spec.PVC.AccessModes
+	if len(accessModes) > 1 {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("PVC multiple accessModes"),
+			Field:   field.Child("PVC", "accessModes").String(),
+		})
+		return causes
+	}
+	// We know we have one access mode
+	if accessModes[0] != v1.ReadWriteOnce && accessModes[0] != v1.ReadOnlyMany && accessModes[0] != v1.ReadWriteMany {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("Unsupported value: \"%s\": supported values: \"ReadOnlyMany\", \"ReadWriteMany\", \"ReadWriteOnce\"", string(accessModes[0])),
+			Field:   field.Child("PVC", "accessModes").String(),
+		})
+		return causes
+	}
 	return causes
 }
 

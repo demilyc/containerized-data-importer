@@ -1,27 +1,21 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"strconv"
-	"time"
 
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog"
 	"kubevirt.io/containerized-data-importer/pkg/common"
 	"kubevirt.io/containerized-data-importer/pkg/util"
 	prometheusutil "kubevirt.io/containerized-data-importer/pkg/util/prometheus"
 )
-
-type prometheusProgressReader struct {
-	util.CountingReader
-	total int64
-}
 
 const (
 	maxSizeLength = 20
@@ -41,16 +35,8 @@ var (
 
 func init() {
 	namedPipe = flag.String("pipedir", "nopipedir", "The name and directory of the named pipe to read from")
+	klog.InitFlags(nil)
 	flag.Parse()
-	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
-	klog.InitFlags(klogFlags)
-	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
-		f2 := klogFlags.Lookup(f1.Name)
-		if f2 != nil {
-			value := f1.Value.String()
-			f2.Value.Set(value)
-		}
-	})
 
 	prometheus.MustRegister(progress)
 	ownerUID, _ = util.ParseEnvVar(common.OwnerUID, false)
@@ -59,7 +45,6 @@ func init() {
 func main() {
 	defer klog.Flush()
 	klog.V(1).Infoln("Starting cloner target")
-
 	certsDirectory, err := ioutil.TempDir("", "certsdir")
 	if err != nil {
 		panic(err)
@@ -77,78 +62,59 @@ func main() {
 		klog.Errorf("%+v", err)
 		os.Exit(1)
 	}
+	klog.V(3).Infof("Size read: %d\n", total)
 
 	//re-open pipe with fresh start.
-	out, err := os.OpenFile(*namedPipe, os.O_RDONLY, 0600)
+	out, err := os.OpenFile(*namedPipe, os.O_RDONLY, os.ModeNamedPipe)
 	if err != nil {
 		klog.Errorf("%+v", err)
 		os.Exit(1)
 	}
 	defer out.Close()
 
-	promReader := &prometheusProgressReader{
-		CountingReader: util.CountingReader{
-			Reader:  out,
-			Current: 0,
-		},
-		total: total,
+	promReader := prometheusutil.NewProgressReader(out, total, progress, ownerUID)
+	promReader.StartTimedUpdate()
+	volumeMode := v1.PersistentVolumeBlock
+	if _, err := os.Stat(common.ImporterWriteBlockPath); os.IsNotExist(err) {
+		volumeMode = v1.PersistentVolumeFilesystem
+	}
+	if volumeMode == v1.PersistentVolumeBlock {
+		klog.V(3).Infoln("Writing data to block device")
+		err = util.StreamDataToFile(promReader, common.ImporterWriteBlockPath)
+	} else {
+		klog.V(3).Infoln("Writing data to file system")
+		err = util.UnArchiveTar(promReader, ".")
 	}
 
-	// Start the progress update thread.
-	go promReader.timedUpdateProgress()
-
-	err = util.UnArchiveTar(promReader, ".")
 	if err != nil {
 		klog.Errorf("%+v", err)
 		os.Exit(1)
 	}
-
 	klog.V(1).Infoln("clone complete")
 }
 
-func collectTotalSize() (int64, error) {
+func collectTotalSize() (uint64, error) {
 	klog.V(3).Infoln("Reading total size")
-	out, err := os.OpenFile(*namedPipe, os.O_RDONLY, 0600)
+	out, err := os.OpenFile(*namedPipe, os.O_RDONLY, os.ModeNamedPipe)
 	if err != nil {
-		return int64(-1), err
+		return uint64(0), err
 	}
 	defer out.Close()
-	return readTotal(out), nil
-}
-
-func (r *prometheusProgressReader) timedUpdateProgress() {
-	for true {
-		// Update every second.
-		time.Sleep(time.Second)
-		r.updateProgress()
-	}
-}
-
-func (r *prometheusProgressReader) updateProgress() {
-	if r.total > 0 {
-		currentProgress := float64(r.Current) / float64(r.total) * 100.0
-		metric := &dto.Metric{}
-		progress.WithLabelValues(ownerUID).Write(metric)
-		if currentProgress > *metric.Counter.Value {
-			progress.WithLabelValues(ownerUID).Add(currentProgress - *metric.Counter.Value)
-		}
-		klog.V(1).Infoln(fmt.Sprintf("%.2f", currentProgress))
-	}
+	return readTotal(out)
 }
 
 // read total file size from reader, and return the value as an int64
-func readTotal(r io.Reader) int64 {
-	totalScanner := bufio.NewScanner(r)
-	if !totalScanner.Scan() {
-		klog.Errorf("Unable to determine length of file")
-		return -1
-	}
-	totalText := totalScanner.Text()
-	total, err := strconv.ParseInt(totalText, 10, 64)
+func readTotal(r io.Reader) (uint64, error) {
+	b := make([]byte, 16)
+
+	n, err := r.Read(b)
 	if err != nil {
 		klog.Errorf("%+v", err)
-		return -1
+		return uint64(0), err
 	}
-	klog.V(1).Infoln(fmt.Sprintf("total size: %s", totalText))
-	return total
+	if n != len(b) {
+		// Didn't read all 16 bytes..
+		return uint64(0), errors.New("Didn't read all bytes for size header")
+	}
+	return strconv.ParseUint(string(b), 16, 64)
 }

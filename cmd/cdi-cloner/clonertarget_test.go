@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,12 +15,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	dto "github.com/prometheus/client_model/go"
-
 	"kubevirt.io/containerized-data-importer/pkg/util"
 	prometheusutil "kubevirt.io/containerized-data-importer/pkg/util/prometheus"
-
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 func init() {
@@ -43,64 +42,39 @@ var _ = Describe("Prometheus Endpoint", func() {
 	})
 })
 
-var _ = Describe("Update Progress", func() {
-	BeforeEach(func() {
-		progress = prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "import_progress",
-				Help: "The import progress in percentage",
-			},
-			[]string{"ownerUID"},
-		)
-	})
-
-	It("Parse valid progress update", func() {
-		By("Verifying the initial value is 0")
-		progress.WithLabelValues(ownerUID).Add(0)
-		metric := &dto.Metric{}
-		progress.WithLabelValues(ownerUID).Write(metric)
-		Expect(*metric.Counter.Value).To(Equal(float64(0)))
-		By("Calling updateProgress with value")
-		promReader := &prometheusProgressReader{
-			CountingReader: util.CountingReader{
-				Current: int64(45),
-			},
-			total: int64(100),
-		}
-		promReader.updateProgress()
-		progress.WithLabelValues(ownerUID).Write(metric)
-		Expect(*metric.Counter.Value).To(Equal(float64(45)))
-	})
-
-	It("0 total should return 0", func() {
-		metric := &dto.Metric{}
-		By("Calling updateProgress with value")
-		promReader := &prometheusProgressReader{
-			CountingReader: util.CountingReader{
-				Current: int64(45),
-			},
-			total: int64(0),
-		}
-		promReader.updateProgress()
-		progress.WithLabelValues(ownerUID).Write(metric)
-		Expect(*metric.Counter.Value).To(Equal(float64(0)))
-	})
-
-})
-
 var _ = Describe("Read total", func() {
 	It("should read total from valid Reader", func() {
-		reader := strings.NewReader("1234\n")
-		result := readTotal(reader)
-		Expect(result).To(Equal(int64(1234)))
-		result = readTotal(reader)
-		Expect(result).To(Equal(int64(-1)))
+		b := []byte(fmt.Sprintf("%016x", 1234))
+		Expect(16).To(Equal(len(b)))
+		reader := bytes.NewReader(b)
+		result, err := readTotal(reader)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(uint64(1234)))
+	})
+
+	It("should read 0 total from valid Reader, with no error", func() {
+		b := []byte(fmt.Sprintf("%016x", 0))
+		Expect(16).To(Equal(len(b)))
+		reader := bytes.NewReader(b)
+		result, err := readTotal(reader)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(uint64(0)))
+	})
+
+	It("should read MAX uint64 total from valid Reader, with no error", func() {
+		b := []byte(fmt.Sprintf("%016x", uint64(math.MaxUint64)))
+		Expect(16).To(Equal(len(b)))
+		reader := bytes.NewReader(b)
+		result, err := readTotal(reader)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(uint64(math.MaxUint64)).To(Equal(result))
 	})
 
 	It("should read total from valid Reader", func() {
 		reader := strings.NewReader("abc\n")
-		result := readTotal(reader)
-		Expect(result).To(Equal(int64(-1)))
+		result, err := readTotal(reader)
+		Expect(err).To(HaveOccurred())
+		Expect(result).To(Equal(uint64(0)))
 	})
 
 	It("should read total size from existing file", func() {
@@ -108,7 +82,7 @@ var _ = Describe("Read total", func() {
 		namedPipe = &file
 		result, err := collectTotalSize()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result).To(Equal(int64(1234567890)))
+		Expect(result).To(Equal(uint64(math.MaxUint64)))
 	})
 
 	It("should not read total size from non-existing file", func() {
@@ -116,7 +90,7 @@ var _ = Describe("Read total", func() {
 		namedPipe = &invalidFile
 		result, err := collectTotalSize()
 		Expect(err).To(HaveOccurred())
-		Expect(result).To(Equal(int64(-1)))
+		Expect(result).To(Equal(uint64(0)))
 	})
 })
 
@@ -133,13 +107,7 @@ var _ = Describe("Read total", func() {
 		tarFileReader, err := os.Open(tarFileName)
 		Expect(err).NotTo(HaveOccurred())
 		defer tarFileReader.Close()
-		promReader := &prometheusProgressReader{
-			CountingReader: util.CountingReader{
-				Reader:  tarFileReader,
-				Current: 0,
-			},
-			total: int64(10240), //10240 is the size of the tar containing the file.
-		}
+		promReader := prometheusutil.NewProgressReader(tarFileReader, uint64(10240), progress, ownerUID)
 		err = util.UnArchiveTar(promReader, targetDirectory)
 		Expect(err).NotTo(HaveOccurred())
 		empty, err = isDirEmpty(targetDirectory)

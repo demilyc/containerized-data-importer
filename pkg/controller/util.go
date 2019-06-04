@@ -9,10 +9,12 @@ import (
 	"strings"
 	"time"
 
+	crdv1alpha1 "github.com/kubernetes-csi/external-snapshotter/pkg/apis/volumesnapshot/v1alpha1"
 	routev1 "github.com/openshift/api/route/v1"
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	extclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -20,14 +22,15 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/util/cert/triple"
 	"k8s.io/klog"
+
 	cdiv1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
 	clientset "kubevirt.io/containerized-data-importer/pkg/client/clientset/versioned"
 	"kubevirt.io/containerized-data-importer/pkg/common"
 	"kubevirt.io/containerized-data-importer/pkg/keys"
 	"kubevirt.io/containerized-data-importer/pkg/operator"
 	"kubevirt.io/containerized-data-importer/pkg/util"
+	"kubevirt.io/containerized-data-importer/pkg/util/cert/triple"
 )
 
 const (
@@ -141,6 +144,14 @@ func getContentType(pvc *v1.PersistentVolumeClaim) string {
 		contentType = string(cdiv1.DataVolumeKubeVirt)
 	}
 	return contentType
+}
+
+// returns the volumeMode which determines if the PVC is block PVC or not.
+func getVolumeMode(pvc *v1.PersistentVolumeClaim) v1.PersistentVolumeMode {
+	if pvc.Spec.VolumeMode != nil {
+		return *pvc.Spec.VolumeMode
+	}
+	return v1.PersistentVolumeFilesystem
 }
 
 // returns the name of the secret containing endpoint credentials consumed by the importer pod.
@@ -351,13 +362,6 @@ func MakeImporterPodSpec(image, verbose, pullPolicy string, podEnvVar *importPod
 		},
 	}
 
-	volumeMounts := []v1.VolumeMount{
-		{
-			Name:      DataVolName,
-			MountPath: common.ImporterDataDir,
-		},
-	}
-
 	if scratchPvcName != nil {
 		volumes = append(volumes, v1.Volume{
 			Name: ScratchVolName,
@@ -367,10 +371,6 @@ func MakeImporterPodSpec(image, verbose, pullPolicy string, podEnvVar *importPod
 					ReadOnly:  false,
 				},
 			},
-		})
-		volumeMounts = append(volumeMounts, v1.VolumeMount{
-			Name:      ScratchVolName,
-			MountPath: common.ScratchDataDir,
 		})
 	}
 
@@ -408,7 +408,6 @@ func MakeImporterPodSpec(image, verbose, pullPolicy string, podEnvVar *importPod
 					Name:            common.ImporterPodName,
 					Image:           image,
 					ImagePullPolicy: v1.PullPolicy(pullPolicy),
-					VolumeMounts:    volumeMounts,
 					Args:            []string{"-v=" + verbose},
 					Ports: []v1.ContainerPort{
 						{
@@ -428,6 +427,20 @@ func MakeImporterPodSpec(image, verbose, pullPolicy string, podEnvVar *importPod
 	if len(pvc.OwnerReferences) == 1 {
 		ownerUID = pvc.OwnerReferences[0].UID
 	}
+
+	if getVolumeMode(pvc) == v1.PersistentVolumeBlock {
+		pod.Spec.Containers[0].VolumeDevices = addVolumeDevices()
+	} else {
+		pod.Spec.Containers[0].VolumeMounts = addVolumeMounts()
+	}
+
+	if scratchPvcName != nil {
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, v1.VolumeMount{
+			Name:      ScratchVolName,
+			MountPath: common.ScratchDataDir,
+		})
+	}
+
 	pod.Spec.Containers[0].Env = makeEnv(podEnvVar, ownerUID)
 
 	if podEnvVar.certConfigMap != "" {
@@ -450,8 +463,29 @@ func MakeImporterPodSpec(image, verbose, pullPolicy string, podEnvVar *importPod
 		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, vm)
 		pod.Spec.Volumes = append(pod.Spec.Volumes, vol)
 	}
-
 	return pod
+}
+
+// this is being called for pods using PV with block volume mode
+func addVolumeDevices() []v1.VolumeDevice {
+	volumeDevices := []v1.VolumeDevice{
+		{
+			Name:       DataVolName,
+			DevicePath: common.ImporterWriteBlockPath,
+		},
+	}
+	return volumeDevices
+}
+
+// this is being called for pods using PV with filesystem volume mode
+func addVolumeMounts() []v1.VolumeMount {
+	volumeMounts := []v1.VolumeMount{
+		{
+			Name:      DataVolName,
+			MountPath: common.ImporterDataDir,
+		},
+	}
+	return volumeMounts
 }
 
 // return the Env portion for the importer container.
@@ -528,7 +562,7 @@ func addToMap(m1, m2 map[string]string) map[string]string {
 }
 
 // returns the CloneRequest string which contains the pvc name (and namespace) from which we want to clone the image.
-func getCloneRequestPVC(pvc *v1.PersistentVolumeClaim) (string, error) {
+func getCloneRequestPVCAnnotation(pvc *v1.PersistentVolumeClaim) (string, error) {
 	cr, found := pvc.Annotations[AnnCloneRequest]
 	if !found || cr == "" {
 		verb := "empty"
@@ -540,7 +574,21 @@ func getCloneRequestPVC(pvc *v1.PersistentVolumeClaim) (string, error) {
 	return cr, nil
 }
 
-// ParseSourcePvcAnnotation parses out the annotations for a CDI PVC
+// returns the CloneRequest string which contains the pvc name (and namespace) from which we want to clone the image.
+func getCloneRequestSourcePVC(pvc *v1.PersistentVolumeClaim, pvcLister corelisters.PersistentVolumeClaimLister) (*v1.PersistentVolumeClaim, error) {
+	ann, err := getCloneRequestPVCAnnotation(pvc)
+	if err != nil {
+		return nil, err
+	}
+	namespace, name := ParseSourcePvcAnnotation(ann, "/")
+	if namespace == "" || name == "" {
+		return nil, errors.New("Unable to parse to source PVC annotation")
+	}
+	return pvcLister.PersistentVolumeClaims(namespace).Get(name)
+
+}
+
+// ParseSourcePvcAnnotation parses out the annotations for a CDI PVC, splitting the string based on the delimiter argument
 func ParseSourcePvcAnnotation(sourcePvcAnno, del string) (namespace, name string) {
 	strArr := strings.Split(sourcePvcAnno, del)
 	if strArr == nil || len(strArr) < 2 {
@@ -548,6 +596,30 @@ func ParseSourcePvcAnnotation(sourcePvcAnno, del string) (namespace, name string
 		return "", ""
 	}
 	return strArr[0], strArr[1]
+}
+
+// ValidateCanCloneSourceAndTargetSpec validates the specs passed in are compatible for cloning.
+func ValidateCanCloneSourceAndTargetSpec(sourceSpec, targetSpec *v1.PersistentVolumeClaimSpec) error {
+	sourceRequest := sourceSpec.Resources.Requests[v1.ResourceStorage]
+	targetRequest := targetSpec.Resources.Requests[v1.ResourceStorage]
+	// Verify that the target PVC size is equal or larger than the source.
+	if sourceRequest.Value() > targetRequest.Value() {
+		return errors.New("Target resources requests storage size is smaller than the source")
+	}
+	// Verify that the source and target volume modes are the same.
+	sourceVolumeMode := v1.PersistentVolumeFilesystem
+	if sourceSpec.VolumeMode != nil && *sourceSpec.VolumeMode == v1.PersistentVolumeBlock {
+		sourceVolumeMode = v1.PersistentVolumeBlock
+	}
+	targetVolumeMode := v1.PersistentVolumeFilesystem
+	if targetSpec.VolumeMode != nil && *targetSpec.VolumeMode == v1.PersistentVolumeBlock {
+		targetVolumeMode = v1.PersistentVolumeBlock
+	}
+	if sourceVolumeMode != targetVolumeMode {
+		return errors.New("Source and target volume modes do not match")
+	}
+	// Can clone.
+	return nil
 }
 
 // CreateCloneSourcePod creates our cloning src pod which will be used for out of band cloning to read the contents of the src PVC
@@ -572,6 +644,7 @@ func MakeCloneSourcePodSpec(image, pullPolicy, sourcePvcName string, pvc *v1.Per
 	id := string(pvc.GetUID())
 	blockOwnerDeletion := true
 	isController := true
+
 	pod := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Pod",
@@ -588,7 +661,7 @@ func MakeCloneSourcePodSpec(image, pullPolicy, sourcePvcName string, pvc *v1.Per
 				common.CDIComponentLabel: common.ClonerSourcePodName,
 				common.CloningLabelKey:   common.CloningLabelValue + "-" + id, //used by podAffity
 				// this label is used when searching for a pvc's cloner source pod.
-				CloneUniqueID: pvc.Name + "-source-pod",
+				CloneUniqueID: id + "-source-pod",
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -602,32 +675,43 @@ func MakeCloneSourcePodSpec(image, pullPolicy, sourcePvcName string, pvc *v1.Per
 			},
 		},
 		Spec: v1.PodSpec{
-			Containers: []v1.Container{
+			// We create initContainer just to set the pod as privileged.
+			// The pod has to be privileged as it has to have access to the hostPath in the node.
+			// However, currently there is a bug that we cannot attach block device to the pod if the pod (container)
+			// is privileged:
+			//https://github.com/kubernetes/kubernetes/issues/58251
+			//https://github.com/kubernetes/kubernetes/issues/62560
+			// As a result of that, instead setting the SecurityContext field as Privileged, in the main container
+			// where we need to have access to  the hostPath, we set the SecurityContext field in the initContainer,
+			// and that will do it.
+			InitContainers: []v1.Container{
 				{
-					Name:            common.ClonerSourcePodName,
-					Image:           image,
-					ImagePullPolicy: v1.PullPolicy(pullPolicy),
-					SecurityContext: &v1.SecurityContext{
-						Privileged: &[]bool{true}[0],
-						RunAsUser:  &[]int64{0}[0],
-					},
+					Name:  "init",
+					Image: image,
 					VolumeMounts: []v1.VolumeMount{
-						{
-							Name:      ImagePathName,
-							MountPath: common.ClonerImagePath,
-						},
 						{
 							Name:      socketPathName,
 							MountPath: common.ClonerSocketPath + "/" + id,
 						},
 					},
-					Args: []string{"source", id},
+					SecurityContext: &v1.SecurityContext{
+						Privileged: &[]bool{true}[0],
+						RunAsUser:  &[]int64{0}[0],
+					},
+					Command: []string{"sh", "-c", "echo setting the pod as privileged"},
+				},
+			},
+			Containers: []v1.Container{
+				{
+					Name:            common.ClonerSourcePodName,
+					Image:           image,
+					ImagePullPolicy: v1.PullPolicy(pullPolicy),
 				},
 			},
 			RestartPolicy: v1.RestartPolicyNever,
 			Volumes: []v1.Volume{
 				{
-					Name: ImagePathName,
+					Name: DataVolName,
 					VolumeSource: v1.VolumeSource{
 						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
 							ClaimName: sourcePvcName,
@@ -646,7 +730,52 @@ func MakeCloneSourcePodSpec(image, pullPolicy, sourcePvcName string, pvc *v1.Per
 			},
 		},
 	}
+
+	var volumeMode v1.PersistentVolumeMode
+	if pvc.Spec.VolumeMode != nil {
+		volumeMode = *pvc.Spec.VolumeMode
+	} else {
+		volumeMode = v1.PersistentVolumeFilesystem
+	}
+	if volumeMode == v1.PersistentVolumeBlock {
+		pod.Spec.Containers[0].VolumeDevices = addVolumeDevices()
+		pod.Spec.Containers[0].VolumeMounts = addCloneVolumeMounts("Block", id)
+		pod.Spec.Containers[0].Args = addArgs("source", id, "block")
+	} else {
+		pod.Spec.Containers[0].VolumeMounts = addCloneVolumeMounts("FS", id)
+		pod.Spec.Containers[0].Args = addArgs("source", id, "FS")
+	}
 	return pod
+}
+
+func addArgs(source, id, volumeMode string) []string {
+	args := []string{
+		source, id, volumeMode,
+	}
+	return args
+}
+
+func addCloneVolumeMounts(volumeMode, id string) []v1.VolumeMount {
+	if volumeMode == "Block" {
+		volumeMounts := []v1.VolumeMount{
+			{
+				Name:      socketPathName,
+				MountPath: common.ClonerSocketPath + "/" + id,
+			},
+		}
+		return volumeMounts
+	}
+	volumeMounts := []v1.VolumeMount{
+		{
+			Name:      DataVolName,
+			MountPath: common.ClonerImagePath,
+		},
+		{
+			Name:      socketPathName,
+			MountPath: common.ClonerSocketPath + "/" + id,
+		},
+	}
+	return volumeMounts
 }
 
 // CreateCloneTargetPod creates our cloning tgt pod which will be used for out of band cloning to write the contents of the tgt PVC
@@ -690,7 +819,7 @@ func MakeCloneTargetPodSpec(image, pullPolicy, podAffinityNamespace string, pvc 
 				common.CDILabelKey:       common.CDILabelValue, //filtered by the podInformer
 				common.CDIComponentLabel: common.ClonerTargetPodName,
 				// this label is used when searching for a pvc's cloner target pod.
-				CloneUniqueID:          pvc.Name + "-target-pod",
+				CloneUniqueID:          id + "-target-pod",
 				common.PrometheusLabel: "",
 			},
 			OwnerReferences: []metav1.OwnerReference{
@@ -724,26 +853,38 @@ func MakeCloneTargetPodSpec(image, pullPolicy, podAffinityNamespace string, pvc 
 					},
 				},
 			},
-			Containers: []v1.Container{
+			// We create initContainer just to set the pod as privileged.
+			// The pod has to be privileged as it has to have access to the hostPath in the node.
+			// However, currently there is a bug that we cannot attach block device to the pod if the pod (container)
+			// is privileged:
+			//https://github.com/kubernetes/kubernetes/issues/58251
+			//https://github.com/kubernetes/kubernetes/issues/62560
+			// As a result of that, instead setting the SecurityContext field as Privileged, in the main container
+			// where we need to have access to  the hostPath, we set the SecurityContext field in the initContainer,
+			// and that will do it.
+			InitContainers: []v1.Container{
 				{
-					Name:            common.ClonerTargetPodName,
-					Image:           image,
-					ImagePullPolicy: v1.PullPolicy(pullPolicy),
-					SecurityContext: &v1.SecurityContext{
-						Privileged: &[]bool{true}[0],
-						RunAsUser:  &[]int64{0}[0],
-					},
+					Name:  "init",
+					Image: image,
 					VolumeMounts: []v1.VolumeMount{
-						{
-							Name:      ImagePathName,
-							MountPath: common.ClonerImagePath,
-						},
 						{
 							Name:      socketPathName,
 							MountPath: common.ClonerSocketPath + "/" + id,
 						},
 					},
-					Args: []string{"target", id},
+					SecurityContext: &v1.SecurityContext{
+						Privileged: &[]bool{true}[0],
+						RunAsUser:  &[]int64{0}[0],
+					},
+					Command: []string{"sh", "-c", "echo setting the pod as privileged"},
+				},
+			},
+
+			Containers: []v1.Container{
+				{
+					Name:            common.ClonerTargetPodName,
+					Image:           image,
+					ImagePullPolicy: v1.PullPolicy(pullPolicy),
 					Ports: []v1.ContainerPort{
 						{
 							Name:          "metrics",
@@ -762,7 +903,7 @@ func MakeCloneTargetPodSpec(image, pullPolicy, podAffinityNamespace string, pvc 
 			RestartPolicy: v1.RestartPolicyNever,
 			Volumes: []v1.Volume{
 				{
-					Name: ImagePathName,
+					Name: DataVolName,
 					VolumeSource: v1.VolumeSource{
 						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
 							ClaimName: pvc.Name,
@@ -780,6 +921,20 @@ func MakeCloneTargetPodSpec(image, pullPolicy, podAffinityNamespace string, pvc 
 				},
 			},
 		},
+	}
+	var volumeMode v1.PersistentVolumeMode
+	if pvc.Spec.VolumeMode != nil {
+		volumeMode = *pvc.Spec.VolumeMode
+	} else {
+		volumeMode = v1.PersistentVolumeFilesystem
+	}
+	if volumeMode == v1.PersistentVolumeBlock {
+		pod.Spec.Containers[0].VolumeDevices = addVolumeDevices()
+		pod.Spec.Containers[0].VolumeMounts = addCloneVolumeMounts("Block", id)
+		pod.Spec.Containers[0].Args = addArgs("target", id, "block")
+	} else {
+		pod.Spec.Containers[0].VolumeMounts = addCloneVolumeMounts("FS", id)
+		pod.Spec.Containers[0].Args = addArgs("target", id, "FS")
 	}
 	return pod
 }
@@ -822,7 +977,6 @@ func CreateUploadPod(client kubernetes.Interface,
 	}
 
 	klog.V(1).Infof("upload pod \"%s/%s\" (image: %q) created\n", pod.Namespace, pod.Name, image)
-
 	return pod, nil
 }
 
@@ -882,16 +1036,6 @@ func MakeUploadPodSpec(image, verbose, pullPolicy, name string, pvc *v1.Persiste
 					Name:            common.UploadServerPodname,
 					Image:           image,
 					ImagePullPolicy: v1.PullPolicy(pullPolicy),
-					VolumeMounts: []v1.VolumeMount{
-						{
-							Name:      DataVolName,
-							MountPath: common.UploadServerDataDir,
-						},
-						{
-							Name:      ScratchVolName,
-							MountPath: common.ScratchDataDir,
-						},
-					},
 					Env: []v1.EnvVar{
 						{
 							Name: "TLS_KEY",
@@ -970,7 +1114,42 @@ func MakeUploadPodSpec(image, verbose, pullPolicy, name string, pvc *v1.Persiste
 			},
 		},
 	}
+	if getVolumeMode(pvc) == v1.PersistentVolumeBlock {
+		pod.Spec.Containers[0].VolumeDevices = addVolumeDevicesForUpload()
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, v1.EnvVar{
+			Name:  "DESTINATION",
+			Value: "/dev/blockDevice",
+		})
+
+	} else {
+		pod.Spec.Containers[0].VolumeMounts = addVolumeMountsForUpload()
+	}
+
+	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, v1.VolumeMount{
+		Name:      ScratchVolName,
+		MountPath: common.ScratchDataDir,
+	})
 	return pod
+}
+
+func addVolumeDevicesForUpload() []v1.VolumeDevice {
+	volumeDevices := []v1.VolumeDevice{
+		{
+			Name:       DataVolName,
+			DevicePath: common.ImporterWriteBlockPath,
+		},
+	}
+	return volumeDevices
+}
+
+func addVolumeMountsForUpload() []v1.VolumeMount {
+	volumeMounts := []v1.VolumeMount{
+		{
+			Name:      DataVolName,
+			MountPath: common.UploadServerDataDir,
+		},
+	}
+	return volumeMounts
 }
 
 // CreateUploadService creates upload service service manifest and sends to server
@@ -1109,7 +1288,6 @@ func createImportEnvVar(client kubernetes.Interface, pvc *v1.PersistentVolumeCla
 	podEnvVar.contentType = getContentType(pvc)
 
 	var err error
-
 	if podEnvVar.source != SourceNone {
 		podEnvVar.ep, err = getEndpoint(pvc)
 		if err != nil {
@@ -1228,20 +1406,47 @@ func isInsecureTLS(client kubernetes.Interface, pvc *v1.PersistentVolumeClaim) (
 		return false, nil
 	}
 
+	klog.V(3).Infof("Checking configmap %s for host %s", configMapName, url.Host)
+
 	cm, err := client.CoreV1().ConfigMaps(util.GetNamespace()).Get(configMapName, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
+			klog.Warningf("Configmap %s does not exist", configMapName)
 			return false, nil
 		}
 
 		return false, err
 	}
 
-	for host := range cm.Data {
-		if host == url.Host {
+	for key, value := range cm.Data {
+		klog.V(3).Infof("Checking %q against %q: %q", url.Host, key, value)
+
+		if value == url.Host {
 			return true, nil
 		}
 	}
 
 	return false, nil
+}
+
+// IsCsiCrdsDeployed checks whether the CSI snapshotter CRD are deployed
+func IsCsiCrdsDeployed(c extclientset.Interface) bool {
+	vsClass := crdv1alpha1.VolumeSnapshotClassResourcePlural + "." + crdv1alpha1.GroupName
+	vsContent := crdv1alpha1.VolumeSnapshotContentResourcePlural + "." + crdv1alpha1.GroupName
+	vs := crdv1alpha1.VolumeSnapshotResourcePlural + "." + crdv1alpha1.GroupName
+
+	return isCrdDeployed(c, vsClass) &&
+		isCrdDeployed(c, vsContent) &&
+		isCrdDeployed(c, vs)
+}
+
+func isCrdDeployed(c extclientset.Interface, name string) bool {
+	obj, err := c.ApiextensionsV1beta1().CustomResourceDefinitions().Get(name, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return false
+		}
+		return false
+	}
+	return obj != nil
 }

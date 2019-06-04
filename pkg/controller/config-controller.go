@@ -74,7 +74,7 @@ func NewConfigController(client kubernetes.Interface,
 
 	// Bind the ingress SharedIndexInformer to the ingress queue
 	c.ingressInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: c.handleObjAdd,
+		AddFunc: c.handleObject,
 		UpdateFunc: func(old, new interface{}) {
 			newDepl := new.(*extensionsv1beta1.Ingress)
 			oldDepl := old.(*extensionsv1beta1.Ingress)
@@ -82,15 +82,15 @@ func NewConfigController(client kubernetes.Interface,
 				// Periodic resync will send update events for all known ingresses.
 				return
 			}
-			c.handleObjUpdate(new)
+			c.handleObject(new)
 		},
 
-		DeleteFunc: c.handleObjDelete,
+		DeleteFunc: c.handleObject,
 	})
 
 	// Bind the route SharedIndexInformer to the route queue
 	c.routeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: c.handleObjAdd,
+		AddFunc: c.handleObject,
 		UpdateFunc: func(old, new interface{}) {
 			newDepl := new.(*routev1.Route)
 			oldDepl := old.(*routev1.Route)
@@ -98,15 +98,15 @@ func NewConfigController(client kubernetes.Interface,
 				// Periodic resync will send update events for all known routes.
 				return
 			}
-			c.handleObjUpdate(new)
+			c.handleObject(new)
 		},
 
-		DeleteFunc: c.handleObjDelete,
+		DeleteFunc: c.handleObject,
 	})
 
 	// Bind the CDIconfig SharedIndexInformer to the CDIconfig queue
 	c.configInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: c.handleObjAdd,
+		AddFunc: c.handleObject,
 		UpdateFunc: func(old, new interface{}) {
 			newDepl := new.(*cdiv1.CDIConfig)
 			oldDepl := old.(*cdiv1.CDIConfig)
@@ -114,26 +114,17 @@ func NewConfigController(client kubernetes.Interface,
 				// Periodic resync will send update events for all known CDIconfigs.
 				return
 			}
-			c.handleObjUpdate(new)
+			c.handleObject(new)
 		},
 
-		DeleteFunc: c.handleObjDelete,
+		DeleteFunc: c.handleObject,
 	})
 
 	return c
 }
 
-func (c *ConfigController) handleObjAdd(obj interface{}) {
-	c.handleObject(obj, "add")
-}
-func (c *ConfigController) handleObjUpdate(obj interface{}) {
-	c.handleObject(obj, "update")
-}
-func (c *ConfigController) handleObjDelete(obj interface{}) {
-	c.handleObject(obj, "delete")
-}
+func (c *ConfigController) handleObject(obj interface{}) {
 
-func (c *ConfigController) handleObject(obj interface{}, verb string) {
 	var object metav1.Object
 	var ok bool
 	if object, ok = obj.(metav1.Object); !ok {
@@ -227,7 +218,7 @@ func (c *ConfigController) processNextWorkItem() bool {
 }
 
 func (c *ConfigController) syncHandler(key string) error {
-	updateConfig := false
+	var updateConfig bool
 	_, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		runtime.HandleError(errors.Errorf("invalid resource key: %s", key))
@@ -285,6 +276,9 @@ func (c *ConfigController) syncHandler(key string) error {
 	}
 
 	storageClass, err := c.scratchSpaceStorageClassStatus(config)
+	if err != nil {
+		return fmt.Errorf("Error updating CDI Config: %v", err)
+	}
 
 	if storageClass == config.Status.ScratchSpaceStorageClass {
 		updateConfig = updateConfig || false
@@ -350,7 +344,11 @@ func (c *ConfigController) Run(threadiness int, stopCh <-chan struct{}) error {
 		return errors.Errorf("expected >0 threads, got %d", threadiness)
 	}
 
-	if ok := cache.WaitForCacheSync(stopCh, c.ingressesSynced, c.routesSynced); !ok {
+	informersNeedingSync := []cache.InformerSynced{c.ingressesSynced}
+	if isOpenshift := IsOpenshift(c.client); isOpenshift {
+		informersNeedingSync = append(informersNeedingSync, c.routesSynced)
+	}
+	if ok := cache.WaitForCacheSync(stopCh, informersNeedingSync...); !ok {
 		return errors.New("failed to wait for caches to sync")
 	}
 

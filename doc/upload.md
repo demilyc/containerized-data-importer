@@ -31,6 +31,7 @@ In order to upload data to your cluster, the cdi-uploadproxy service must be acc
 
 ```bash
 cat <<EOF | kubectl apply -f -
+apiVersion: v1
 kind: Service
 metadata:
   name: cdi-uploadproxy-nodeport
@@ -88,7 +89,7 @@ kubectl apply -f manifests/example/upload-datavolume.yaml
 ```
 
 ## Request an Upload Token
-Before sending data to the Upload Proxy, and Upload Token must be requested.  The CDI API Server validatees that the user has permissions to `post` to `uploadtokenrequest` resources.
+Before sending data to the Upload Proxy, an Upload Token must be requested.
 
 Take a look at at `manifests/example/upload-token.yaml` for an example.
 ```yaml

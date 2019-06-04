@@ -10,19 +10,22 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog"
+	"kubevirt.io/containerized-data-importer/pkg/common"
 )
 
 // CountingReader is a reader that keeps track of how much has been read
 type CountingReader struct {
 	Reader  io.ReadCloser
-	Current int64
+	Current uint64
 }
 
 // RandAlphaNum provides an implementation to generate a random alpha numeric string of the specified length
@@ -66,13 +69,22 @@ func ParseEnvVar(envVarName string, decode bool) (string, error) {
 // Read reads bytes from the stream and updates the prometheus clone_progress metric according to the progress.
 func (r *CountingReader) Read(p []byte) (n int, err error) {
 	n, err = r.Reader.Read(p)
-	r.Current += int64(n)
+	r.Current += uint64(n)
 	return n, err
 }
 
 // Close closes the stream
 func (r *CountingReader) Close() error {
 	return r.Reader.Close()
+}
+
+// GetAvailableSpaceByVolumeMode calls another method based on the volumeMode parameter to get the amount of
+// available space at the path specified.
+func GetAvailableSpaceByVolumeMode(volumeMode v1.PersistentVolumeMode) int64 {
+	if volumeMode == v1.PersistentVolumeBlock {
+		return GetAvailableSpaceBlock(common.ImporterWriteBlockPath)
+	}
+	return GetAvailableSpace(common.ImporterVolumePath)
 }
 
 // GetAvailableSpace gets the amount of available space at the path specified.
@@ -85,12 +97,54 @@ func GetAvailableSpace(path string) int64 {
 	return int64(stat.Bavail) * int64(stat.Bsize)
 }
 
+// GetAvailableSpaceBlock gets the amount of available space at the block device path specified.
+func GetAvailableSpaceBlock(deviceName string) int64 {
+	cmd := exec.Command("/usr/bin/lsblk", "-n", "-b", "-o", "SIZE", deviceName)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return int64(-1)
+	}
+	i, err := strconv.ParseInt(strings.TrimSpace(string(out.Bytes())), 10, 64)
+	if err != nil {
+		return int64(-1)
+	}
+	return i
+}
+
 // MinQuantity calculates the minimum of two quantities.
 func MinQuantity(availableSpace, imageSize *resource.Quantity) resource.Quantity {
 	if imageSize.Cmp(*availableSpace) == 1 {
 		return *availableSpace
 	}
 	return *imageSize
+}
+
+// StreamDataToFile provides a function to stream the specified io.Reader to the specified local file
+func StreamDataToFile(r io.Reader, fileName string) error {
+	var outFile *os.File
+	var err error
+	if GetAvailableSpaceBlock(fileName) < 0 {
+		// Attempt to create the file with name filePath.  If it exists, fail.
+		outFile, err = os.OpenFile(fileName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, os.ModePerm)
+	} else {
+		outFile, err = os.OpenFile(fileName, os.O_EXCL|os.O_WRONLY, os.ModePerm)
+	}
+	if err != nil {
+		return errors.Wrapf(err, "could not open file %q", fileName)
+	}
+	defer outFile.Close()
+	klog.V(1).Infof("Writing data...\n")
+	if _, err = io.Copy(outFile, r); err != nil {
+		klog.Errorf("Unable to write file from dataReader: %v\n", err)
+		os.Remove(outFile.Name())
+		return errors.Wrapf(err, "unable to write to file")
+	}
+	err = outFile.Sync()
+	return err
 }
 
 // UnArchiveTar unarchives a tar file and streams its files
@@ -153,11 +207,20 @@ func CopyFile(src, dst string) error {
 	return out.Close()
 }
 
-// MoveFileAcrossFs moves a file by doing a copy and then removing the source file. This works across file system which os.Rename won't
-func MoveFileAcrossFs(src, dst string) error {
-	err := CopyFile(src, dst)
-	if err != nil {
-		return err
+// WriteTerminationMessage writes the passed in message to the default termination message file
+func WriteTerminationMessage(message string) error {
+	return WriteTerminationMessageToFile(common.PodTerminationMessageFile, message)
+}
+
+// WriteTerminationMessageToFile writes the passed in message to the passed in message file
+func WriteTerminationMessageToFile(file, message string) error {
+	// Only write the first line of the message.
+	scanner := bufio.NewScanner(strings.NewReader(message))
+	if scanner.Scan() {
+		err := ioutil.WriteFile(file, []byte(scanner.Text()), os.ModeAppend)
+		if err != nil {
+			return errors.Wrap(err, "could not create termination message file")
+		}
 	}
-	return os.Remove(src)
+	return nil
 }

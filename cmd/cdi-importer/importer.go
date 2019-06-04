@@ -14,10 +14,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strconv"
 
+	"github.com/pkg/errors"
+
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog"
 	cdiv1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
@@ -30,16 +34,8 @@ import (
 )
 
 func init() {
+	klog.InitFlags(nil)
 	flag.Parse()
-	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
-	klog.InitFlags(klogFlags)
-	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
-		f2 := klogFlags.Lookup(f1.Name)
-		if f2 != nil {
-			value := f1.Value.String()
-			f2.Value.Set(value)
-		}
-	})
 }
 
 func main() {
@@ -62,37 +58,31 @@ func main() {
 	certDir, _ := util.ParseEnvVar(common.ImporterCertDirVar, false)
 	insecureTLS, _ := strconv.ParseBool(os.Getenv(common.InsecureTLSVar))
 
-	//Registry import currently support only kubevirt content type
+	//Registry import currently support kubevirt content type only
 	if contentType != string(cdiv1.DataVolumeKubeVirt) && source == controller.SourceRegistry {
 		klog.Errorf("Unsupported content type %s when importing from registry", contentType)
 		os.Exit(1)
+	}
+
+	volumeMode := v1.PersistentVolumeBlock
+	if _, err := os.Stat(common.ImporterWriteBlockPath); os.IsNotExist(err) {
+		volumeMode = v1.PersistentVolumeFilesystem
 	}
 
 	dest := common.ImporterWritePath
 	if contentType == string(cdiv1.DataVolumeArchive) {
 		dest = common.ImporterVolumePath
 	}
-	dataDir := common.ImporterDataDir
 
-	klog.V(1).Infoln("begin import process")
-	dso := &importer.DataStreamOptions{
-		Dest:               dest,
-		DataDir:            dataDir,
-		Endpoint:           ep,
-		AccessKey:          acc,
-		SecKey:             sec,
-		Source:             source,
-		ContentType:        contentType,
-		ImageSize:          imageSize,
-		AvailableDestSpace: util.GetAvailableSpace(common.ImporterVolumePath),
-		CertDir:            certDir,
-		InsecureTLS:        insecureTLS,
-		ScratchDataDir:     common.ScratchDataDir,
+	if volumeMode == v1.PersistentVolumeBlock {
+		dest = common.ImporterWriteBlockPath
 	}
 
+	dataDir := common.ImporterDataDir
+	availableDestSpace := util.GetAvailableSpaceByVolumeMode(volumeMode)
 	if source == controller.SourceNone && contentType == string(cdiv1.DataVolumeKubeVirt) {
 		requestImageSizeQuantity := resource.MustParse(imageSize)
-		minSizeQuantity := util.MinQuantity(resource.NewScaledQuantity(dso.AvailableDestSpace, 0), &requestImageSizeQuantity)
+		minSizeQuantity := util.MinQuantity(resource.NewScaledQuantity(availableDestSpace, 0), &requestImageSizeQuantity)
 		if minSizeQuantity.Cmp(requestImageSizeQuantity) != 0 {
 			// Available dest space is smaller than the size we want to create
 			klog.Warningf("Available space less than requested size, creating blank image sized to available space: %s.\n", minSizeQuantity.String())
@@ -100,18 +90,72 @@ func main() {
 		err := image.CreateBlankImage(common.ImporterWritePath, minSizeQuantity)
 		if err != nil {
 			klog.Errorf("%+v", err)
+			err = util.WriteTerminationMessage(fmt.Sprintf("Unable to create blank image: %+v", err))
+			if err != nil {
+				klog.Errorf("%+v", err)
+			}
 			os.Exit(1)
 		}
+	} else if source == controller.SourceNone && contentType == string(cdiv1.DataVolumeArchive) {
+		klog.Errorf("%+v", errors.New("Cannot create empty disk with content type archive"))
+		err = util.WriteTerminationMessage("Cannot create empty disk with content type archive")
+		if err != nil {
+			klog.Errorf("%+v", err)
+		}
+		os.Exit(1)
 	} else {
 		klog.V(1).Infoln("begin import process")
-		err = importer.CopyData(dso)
+		var dp importer.DataSourceInterface
+		switch source {
+		case controller.SourceHTTP:
+			dp, err = importer.NewHTTPDataSource(ep, acc, sec, certDir, cdiv1.DataVolumeContentType(contentType))
+			if err != nil {
+				klog.Errorf("%+v", err)
+				err = util.WriteTerminationMessage(fmt.Sprintf("Unable to connect to http data source: %+v", err))
+				if err != nil {
+					klog.Errorf("%+v", err)
+				}
+				os.Exit(1)
+			}
+		case controller.SourceRegistry:
+			dp = importer.NewRegistryDataSource(ep, acc, sec, certDir, insecureTLS)
+		case controller.SourceS3:
+			dp, err = importer.NewS3DataSource(ep, acc, sec)
+			if err != nil {
+				klog.Errorf("%+v", err)
+				err = util.WriteTerminationMessage(fmt.Sprintf("Unable to connect to s3 data source: %+v", err))
+				if err != nil {
+					klog.Errorf("%+v", err)
+				}
+				os.Exit(1)
+			}
+		default:
+			klog.Errorf("Unknown source type %s\n", source)
+			err = util.WriteTerminationMessage(fmt.Sprintf("Unknown data source: %s", source))
+			if err != nil {
+				klog.Errorf("%+v", err)
+			}
+			os.Exit(1)
+		}
+		defer dp.Close()
+		processor := importer.NewDataProcessor(dp, dest, dataDir, common.ScratchDataDir, imageSize)
+		err = processor.ProcessData()
 		if err != nil {
 			klog.Errorf("%+v", err)
 			if err == importer.ErrRequiresScratchSpace {
 				os.Exit(common.ScratchSpaceNeededExitCode)
 			}
+			err = util.WriteTerminationMessage(fmt.Sprintf("%+v", err))
+			if err != nil {
+				klog.Errorf("%+v", err)
+			}
 			os.Exit(1)
 		}
 	}
-	klog.V(1).Infoln("import complete")
+	err = util.WriteTerminationMessage("Import Complete")
+	if err != nil {
+		klog.Errorf("%+v", err)
+		os.Exit(1)
+	}
+	klog.V(1).Infoln("Import complete")
 }

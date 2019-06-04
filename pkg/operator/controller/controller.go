@@ -469,11 +469,7 @@ func (r *ReconcileCDI) createConfigMap(cr *cdiv1alpha1.CDI) error {
 		return err
 	}
 
-	if err := r.client.Create(context.TODO(), cm); err != nil {
-		return err
-	}
-
-	return nil
+	return r.client.Create(context.TODO(), cm)
 }
 
 func (r *ReconcileCDI) getAllDeployments(cr *cdiv1alpha1.CDI) ([]*appsv1.Deployment, error) {
@@ -495,9 +491,21 @@ func (r *ReconcileCDI) getAllDeployments(cr *cdiv1alpha1.CDI) ([]*appsv1.Deploym
 
 func (r *ReconcileCDI) getNamespacedArgs(cr *cdiv1alpha1.CDI) *cdinamespaced.FactoryArgs {
 	result := *r.namespacedArgs
-	if cr != nil && cr.Spec.ImagePullPolicy != "" {
-		result.PullPolicy = string(cr.Spec.ImagePullPolicy)
+
+	if cr != nil {
+		if cr.Spec.ImageRegistry != "" {
+			result.DockerRepo = cr.Spec.ImageRegistry
+		}
+
+		if cr.Spec.ImageTag != "" {
+			result.DockerTag = cr.Spec.ImageTag
+		}
+
+		if cr.Spec.ImagePullPolicy != "" {
+			result.PullPolicy = string(cr.Spec.ImagePullPolicy)
+		}
 	}
+
 	return &result
 }
 

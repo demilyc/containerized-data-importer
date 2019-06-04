@@ -3,7 +3,6 @@ package tests
 import (
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo"
@@ -11,7 +10,6 @@ import (
 	. "github.com/onsi/gomega"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"kubevirt.io/containerized-data-importer/pkg/common"
 	"kubevirt.io/containerized-data-importer/pkg/controller"
@@ -40,8 +38,8 @@ var _ = Describe("Transport Tests", func() {
 
 	BeforeEach(func() {
 		ns = f.Namespace.Name
-		By(fmt.Sprintf("Waiting for all \"%s/%s\" deployment replicas to be Ready", utils.FileHostNs, utils.FileHostName))
-		utils.WaitForDeploymentReplicasReadyOrDie(c, utils.FileHostNs, utils.FileHostName)
+		By(fmt.Sprintf("Waiting for all \"%s/%s\" deployment replicas to be Ready", f.CdiInstallNs, utils.FileHostName))
+		utils.WaitForDeploymentReplicasReadyOrDie(c, f.CdiInstallNs, utils.FileHostName)
 	})
 
 	// it() is the body of the test and is executed once per Entry() by DescribeTable()
@@ -82,40 +80,27 @@ var _ = Describe("Transport Tests", func() {
 		}
 
 		if insecureRegistry {
-			err = utils.SetInsecureRegistry(c)
+			err = utils.SetInsecureRegistry(c, f.CdiInstallNs, ep)
 			Expect(err).To(BeNil())
-			defer utils.ClearInsecureRegistry(c)
+			defer utils.ClearInsecureRegistry(c, f.CdiInstallNs)
 		}
 
 		By(fmt.Sprintf("Creating PVC with endpoint annotation %q", pvcAnn[controller.AnnEndpoint]))
 		pvc, err := utils.CreatePVCFromDefinition(c, ns, utils.NewPVCDefinition("transport-e2e", "20M", pvcAnn, nil))
 		Expect(err).NotTo(HaveOccurred(), "Error creating PVC")
 
-		_, err = utils.FindPodByPrefix(c, ns, common.ImporterPodName, common.CDILabelSelector)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Unable to get importer pod %q", ns+"/"+common.ImporterPodName))
-
 		if shouldSucceed {
-			By("Waiting for the pod to complete, make sure the next tests are valid")
-			Eventually(func() bool {
-				podList, err := c.CoreV1().Pods(ns).List(metav1.ListOptions{
-					LabelSelector: common.CDILabelSelector,
-				})
-				if err == nil {
-					for _, pod := range podList.Items {
-						if strings.HasPrefix(pod.Name, common.ImporterPodName) {
-							return false
-						}
-					}
-					return true
-				}
-				return false
-			}, timeout, pollingInterval).Should(BeTrue())
+			By("Verify PVC status annotation says succeeded")
+			found, err := utils.WaitPVCPodStatusSucceeded(f.K8sClient, pvc)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
 			By("Verifying PVC is not empty")
 			Expect(framework.VerifyPVCIsEmpty(f, pvc)).To(BeFalse(), fmt.Sprintf("Found 0 imported files on PVC %q", pvc.Namespace+"/"+pvc.Name))
 
 			pod, err := utils.CreateExecutorPodWithPVC(c, sizeCheckPod, ns, pvc)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(utils.WaitTimeoutForPodReady(c, sizeCheckPod, ns, 20*time.Second)).To(Succeed())
+			Expect(utils.WaitTimeoutForPodReady(c, sizeCheckPod, ns, 90*time.Second)).To(Succeed())
 
 			switch pvcAnn[controller.AnnSource] {
 			case controller.SourceHTTP, controller.SourceRegistry:
@@ -127,15 +112,21 @@ var _ = Describe("Transport Tests", func() {
 				}
 			}
 		} else {
+			By("Verify PVC status annotation says failed")
+			found, err := utils.WaitPVCPodStatusFailed(f.K8sClient, pvc)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
 			By("Verifying PVC is empty")
 			Expect(framework.VerifyPVCIsEmpty(f, pvc)).To(BeTrue(), fmt.Sprintf("Found 0 imported files on PVC %q", pvc.Namespace+"/"+pvc.Name))
 		}
 	}
 
-	httpNoAuthEp := fmt.Sprintf("http://%s:%d", utils.FileHostName+"."+utils.FileHostNs, utils.HTTPNoAuthPort)
-	httpsNoAuthEp := fmt.Sprintf("https://%s:%d", utils.FileHostName+"."+utils.FileHostNs, utils.HTTPSNoAuthPort)
-	httpAuthEp := fmt.Sprintf("http://%s:%d", utils.FileHostName+"."+utils.FileHostNs, utils.HTTPAuthPort)
-	registryNoAuthEp := fmt.Sprintf("docker://%s", utils.RegistryHostName+"."+utils.RegistryHostNs)
+	httpNoAuthEp := fmt.Sprintf("http://%s:%d", utils.FileHostName+"."+f.CdiInstallNs, utils.HTTPNoAuthPort)
+	httpsNoAuthEp := fmt.Sprintf("https://%s:%d", utils.FileHostName+"."+f.CdiInstallNs, utils.HTTPSNoAuthPort)
+	httpAuthEp := fmt.Sprintf("http://%s:%d", utils.FileHostName+"."+f.CdiInstallNs, utils.HTTPAuthPort)
+	registryNoAuthEp := fmt.Sprintf("docker://%s", utils.RegistryHostName+"."+f.CdiInstallNs)
+	altRegistryNoAuthEp := fmt.Sprintf("docker://%s.%s:%d", utils.RegistryHostName, f.CdiInstallNs, 5000)
 	DescribeTable("Transport Test Table", it,
 		Entry("should connect to http endpoint without credentials", httpNoAuthEp, targetFile, "", "", controller.SourceHTTP, "", false, true),
 		Entry("should connect to http endpoint with credentials", httpAuthEp, targetFile, utils.AccessKeyValue, utils.SecretKeyValue, controller.SourceHTTP, "", false, true),
@@ -144,6 +135,7 @@ var _ = Describe("Transport Tests", func() {
 		Entry("should connect to QCOW http endpoint with credentials", httpAuthEp, targetQCOWFile, utils.AccessKeyValue, utils.SecretKeyValue, controller.SourceHTTP, "", false, true),
 		Entry("should succeed to import from registry when image contains valid qcow file", registryNoAuthEp, targetQCOWImage, "", "", controller.SourceRegistry, "cdi-docker-registry-host-certs", false, true),
 		Entry("should succeed to import from registry when image contains valid qcow file", registryNoAuthEp, targetQCOWImage, "", "", controller.SourceRegistry, "", true, true),
+		Entry("should succeed to import from registry when image contains valid qcow file", altRegistryNoAuthEp, targetQCOWImage, "", "", controller.SourceRegistry, "", true, true),
 		Entry("should fail no certs", registryNoAuthEp, targetQCOWImage, "", "", controller.SourceRegistry, "", false, false),
 		Entry("should fail bad certs", registryNoAuthEp, targetQCOWImage, "", "", controller.SourceRegistry, "cdi-file-host-certs", false, false),
 		Entry("should succeed to import from registry when image contains valid raw file", registryNoAuthEp, targetRawImage, "", "", controller.SourceRegistry, "cdi-docker-registry-host-certs", false, true),

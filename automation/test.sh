@@ -24,6 +24,11 @@
 
 set -ex
 
+export NAMESPACE="cdi-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 5 | head -n 1)"
+export CDI_NAMESPACE=$NAMESPACE
+
+echo "namespace: ${NAMESPACE}, cdi-namespace: ${CDI_NAMESPACE}"
+
 export WORKSPACE="${WORKSPACE:-$PWD}"
 readonly ARTIFACTS_PATH="exported-artifacts"
 
@@ -32,7 +37,7 @@ mkdir -p "${WORKSPACE}/${ARTIFACTS_PATH}"
 if [[ $TARGET =~ openshift-.* ]]; then
   export KUBEVIRT_PROVIDER="os-3.11.0"
 elif [[ $TARGET =~ k8s-.* ]]; then
-  export KUBEVIRT_PROVIDER="k8s-1.11.0"
+  export KUBEVIRT_PROVIDER="k8s-1.13.3"
 fi
 
 export KUBEVIRT_NUM_NODES=2
